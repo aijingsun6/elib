@@ -1,6 +1,6 @@
 {application, elib,
- [{description, "erlang normal lib"},
-  {vsn, "0.0.1"},
+ [{description, "erlang common library"},
+  {vsn, "0.0.2"},
   {registered, []},
   {mod, {elib_app, []}},
   {applications,
@@ -9,7 +9,6 @@
    ]},
   {env,[]},
   {modules, []},
-
   {licenses, ["Apache 2.0"]},
   {links, []}
  ]}.
