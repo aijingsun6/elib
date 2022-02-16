@@ -1,6 +1,6 @@
 {application, elib,
  [{description, "erlang common library"},
-  {vsn, "0.0.2"},
+  {vsn, "0.0.1"},
   {registered, []},
   {mod, {elib_app, []}},
   {applications,
