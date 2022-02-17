@@ -2,7 +2,10 @@
 -include_lib("kernel/include/logger.hrl").
 -behavior(gen_server).
 
--define(ACCEPT_NUM_DEFAULT, 128).
+-define(ACCEPT_NUM_DEFAULT, 8).
+-define(ACCEPT_TIMEOUT_DEFAULT, 5000).
+-define(CONNECT_MAX_DEFAULT, 1024000).
+
 -define(TCP_OPTIONS_DEFAULT, [
   binary,             % 传输的是二进制
   {packet, raw},      % 不封包
@@ -21,22 +24,18 @@
 
 -record(state, {
   name,
-  port,           % listen port
+  port,
   accept_num,
+  accept_timeout,
   tcp_options,
-  listen_sock,         % listen socket
-  conn = 0,       % current connection
-  conn_max = 50000,% max connection
-  callback,
-  sock_map = #{} % ref -> {pid, socket}
+  listen_sock,             % listen socket
+  conn_cur,                % current connection
+  conn_max,                % max connection
+  loop,                    % {M,F}  M:F(Name,Socket)
+  reject,                  % {M,F}  M:F(Name,Socket)
+  ref_tab                  % {Ref, Pid, Socket}
 }).
 
--record(callback, {
-  loop, % 主循环体，进行服务的函数
-  reg,  % 注册函数，在gen_server启动的时候执行，{Module, Func} or fun/0
-  close,% 服务器退出回调,{Module, Func} or fun/0
-  reject % 拒绝函数，超过最大连接数执行 {Module, Func} or fun/1 (M:F(Name,Socket))
-}).
 -export([
   init/1,
   code_change/3,
@@ -48,140 +47,129 @@
 
 -export([
   start_link/4,
-  start_link/5,
   start_link/6
 ]).
 
-start_link(Name, Port, Max, Callback) ->
-  start_link(Name, Port, Max, ?ACCEPT_NUM_DEFAULT, Callback, ?TCP_OPTIONS_DEFAULT).
+start_link(Name, Port, Loop, Reject) ->
+  start_link(Name, Port, Loop, Reject, ?TCP_OPTIONS_DEFAULT, #{}).
 
-start_link(Name, Port, Max, AcceptNum, Callback) ->
-  start_link(Name, Port, Max, AcceptNum, Callback, ?TCP_OPTIONS_DEFAULT).
-
-start_link(Name, Port, Max, AcceptNum, Callback, TcpOptions) ->
-  State = #state{
+start_link(Name, Port, Loop, Reject, TcpOption, Prop) ->
+  ConnMax = maps:get(conn_max, Prop, ?CONNECT_MAX_DEFAULT),
+  AcceptNum = maps:get(accept_num, Prop, ?ACCEPT_NUM_DEFAULT),
+  AcceptTimeout = maps:get(accept_timeout, Prop, ?ACCEPT_TIMEOUT_DEFAULT),
+  true = (is_integer(ConnMax) andalso ConnMax > 0),
+  true = (is_integer(AcceptNum) andalso AcceptNum > 0),
+  true = (is_integer(AcceptTimeout) andalso AcceptTimeout > 0),
+  S = #state{
     name = Name,
     port = Port,
-    conn = 0,
-    conn_max = Max,
+    conn_cur = 0,
+    conn_max = ConnMax,
     accept_num = AcceptNum,
-    tcp_options = TcpOptions,
-    callback = func2callback(Callback),
-    sock_map = #{}
+    accept_timeout = AcceptTimeout,
+    tcp_options = TcpOption,
+    loop = Loop,
+    reject = Reject
   },
-  gen_server:start_link({local, Name}, ?MODULE, State, []).
+  gen_server:start_link({local, Name}, ?MODULE, S, []).
 
-func2callback({_, _} = LoopFunc) ->
-  func2callback([LoopFunc, undefined, undefined, undefined]);
-func2callback([LoopFunc]) ->
-  func2callback([LoopFunc, undefined, undefined, undefined]);
-func2callback([LoopFunc, CloseFunc]) ->
-  func2callback([LoopFunc, CloseFunc, undefined, undefined]);
-func2callback([LoopFunc, CloseFunc, RegFunc]) ->
-  func2callback([LoopFunc, CloseFunc, RegFunc, undefined]);
-func2callback([LoopFunc, CloseFunc, RegFunc, RejectFunc]) ->
-  #callback{loop = LoopFunc, close = CloseFunc, reg = RegFunc, reject = RejectFunc}.
+tab_name(Name) ->
+  erlang:list_to_atom(lists:concat([?MODULE, "_", Name])).
 
-init(State = #state{name = Name, port = Port, accept_num = AcceptNum, callback = Callback, tcp_options = TcpOptions}) ->
+init(S = #state{name = Name, port = Port, accept_num = AcceptNum, tcp_options = TcpOptions}) ->
   process_flag(trap_exit, true),
   ?LOG_INFO("~p initializing port ~p", [Name, Port]),
-  reg_func(Callback),
   case gen_tcp:listen(Port, TcpOptions) of
     {ok, ListenSock} ->
       ?LOG_INFO("~p,socket listen success at port ~p", [Name, Port]),
-      State2 = State#state{listen_sock = ListenSock},
-      start_accepters(AcceptNum, State2),
-      {ok, State2};
+      Tab = tab_name(Name),
+      ets:new(Tab, [named_table, set]),
+      S2 = S#state{listen_sock = ListenSock, ref_tab = Tab},
+      start_accept(AcceptNum, S2),
+      {ok, S2};
     {error, Why} ->
-      ?LOG_ERROR("~p,socket listen fail at port ~p with ~p", [Port, Why]),
+      ?LOG_ERROR("~p,socket listen fail at port ~p with ~p", [Name, Port, Why]),
       {stop, Why}
   end.
 
-handle_call({conn_accept, Pid, Socket}, _, #state{conn = Conn, conn_max = MaxConn, sock_map = M} = State) ->
+handle_call({check_conn_num, Pid, Socket}, _, #state{conn_cur = Conn, conn_max = MaxConn, ref_tab = Tab} = S) ->
   case Conn < MaxConn of
     true ->
       Ref = erlang:monitor(process, Pid),
-      M2 = M#{Ref => {Pid, Socket}},
-      {reply, true, State#state{conn = Conn + 1, sock_map = M2}};
+      ets:insert(Tab, {Ref, Pid, Socket}),
+      {reply, true, S#state{conn_cur = Conn + 1}};
     false ->
-      {reply, false, State}
+      {reply, false, S}
   end;
 handle_call(_Msg, _Caller, State) ->
   {noreply, State}.
 
 handle_cast(accept_new, State) ->
-  proc_lib:spawn(fun() -> accepter(State) end),
+  proc_lib:spawn(fun() -> accept(State) end),
   {noreply, State};
-handle_cast(_Request, State) ->
+handle_cast(_Request, #state{name = Name} = State) ->
+  ?LOG_WARNING("~p unhandled cast msg :~p", [Name, _Request]),
   {noreply, State}.
 
-handle_info({'DOWN', Ref, _Type, _Object, _Info}, #state{sock_map = M, name = Name, conn = Con} = State) ->
+handle_info({'DOWN', Ref, _Type, _Object, _Info}, #state{name = Name, conn_cur = Conn, ref_tab = Tab} = S) ->
   erlang:demonitor(Ref, [flush]),
-  case M of
-    #{Ref := {P, Socket}} ->
-      ?LOG_INFO("~p, pid ~p, socket ~ts disconnect.", [Name, P, Socket]),
-      M2 = maps:remove(Ref, M),
-      {noreply, State#state{sock_map = M2, conn = Con - 1}};
-    #{} ->
-      {noreply, State}
+  case ets:lookup(Tab, Ref) of
+    [{_, Pid, Socket}] ->
+      ?LOG_INFO("~p, pid ~p, socket ~p disconnect.", [Name, Pid, socket_ip_str(Socket)]),
+      ets:delete(Tab, Ref),
+      {noreply, S#state{conn_cur = Conn - 1}};
+    [] ->
+      {noreply, S}
   end;
-handle_info(_Msg, State) ->
+handle_info(_Msg, #state{name = Name} = State) ->
+  ?LOG_WARNING("~p unhandled info msg :~p", [Name, _Request]),
   {noreply, State}.
 
 code_change(_OldVersion, Library, _Extra) ->
   {ok, Library}.
 
-terminate(_Reason, #state{name = Name, callback = Callback}) ->
-  ?LOG_INFO("~p stopping ~n", [Name]),
-  close_func(Callback),
+terminate(_Reason, #state{name = Name, listen_sock = ListenSock, ref_tab = Tab}) ->
+  ?LOG_INFO("~p stopping with ~p", [Name, _Reason]),
+  gen_tcp:close(ListenSock),
+  F = fun({_Ref, Pid, _Sock}, Acc) -> erlang:exit(Pid, _Reason), Acc end,
+  ets:foldl(F, [], Tab),
   ok.
 
-% 注册函数执行
-reg_func(#callback{reg = {M, F}}) -> M:F();
-reg_func(_) -> ok.
-
-loop_func(#callback{loop = {M, F}}, Socket) ->
+loop_func(Name, Socket, {M, F}) ->
   try
-    M:F(Socket)
+    M:F(Name, Socket)
   catch
     ?EXCEPTION(Class, Reason, Stacktrace) ->
-      gen_tcp:close(Socket),
+      catch gen_tcp:close(Socket),
       ?LOG_ERROR("tcp loop fail, stacktrace: ~p, class: ~p, reason: ~p ~n", [?GET_STACK(Stacktrace), Class, Reason])
-  end;
-loop_func(_, Socket) ->
-  gen_tcp:close(Socket).
+  end.
 
-reject_func(#callback{reject = {M, F}}, Socket) ->
-  M:F(Socket),
+reject_func(Name, Socket, {M, F}) ->
+  M:F(Name, Socket),
   gen_tcp:close(Socket);
-reject_func(_, Socket) ->
+reject_func(_, Socket, _) ->
   gen_tcp:close(Socket).
 
-close_func(#callback{close = {M, F}}) -> M:F();
-close_func(_) -> ok.
-
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-start_accepters(Num, _State) when Num < 1 ->
+start_accept(Num, _State) when Num < 1 ->
   ok;
-start_accepters(Num, State) ->
-  proc_lib:spawn(fun() -> accepter(State) end),
-  start_accepters(Num - 1, State).
+start_accept(Num, State) ->
+  proc_lib:spawn(fun() -> accept(State) end),
+  start_accept(Num - 1, State).
 
-accepter(#state{name = Name, listen_sock = ListenSock, callback = Callback}) ->
-  case gen_tcp:accept(ListenSock) of
+accept(#state{name = Name, listen_sock = ListenSock, loop = Loop, reject = Reject, accept_timeout = Timeout}) ->
+  case gen_tcp:accept(ListenSock, Timeout) of
     {ok, Socket} ->
       Self = self(),
-      SockStr = socket_ip_str(Socket),
-      ?LOG_INFO("pid:~p,accept socket ~ts", [Self, SockStr]),
+      ?LOG_INFO("~p,pid:~p,accept socket ~ts", [Name, Self, socket_ip_str(Socket)]),
       gen_server:cast(Name, accept_new),
-      case gen_server:call(Name, {conn_accept, Self, SockStr}) of
+      case gen_server:call(Name, {check_conn_num, Self, Socket}) of
         true ->
-          loop_func(Callback, Socket);
+          loop_func(Name, Socket, Loop);
         false ->
-          reject_func(Callback, Socket)
+          reject_func(Name, Socket, Reject)
       end;
-    Err ->
-      ?LOG_ERROR("accept socket fail with ~p", [Err]),
+    {error, Reason} ->
+      ?LOG_ERROR("~p accept socket fail with ~p", [Name, Reason]),
       gen_server:cast(Name, accept_new),
       ok
   end.
