@@ -10,5 +10,6 @@
   {env,[]},
   {modules, []},
   {licenses, ["Apache 2.0"]},
-  {links, []}
+  {links, [{"GitHub", "https://github.com/aijingsun6/elib"}]},
+  {files,["src"]}
  ]}.
