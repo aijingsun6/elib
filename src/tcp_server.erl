@@ -3,7 +3,7 @@
 -behavior(gen_server).
 
 -define(ACCEPT_NUM_DEFAULT, 8).
--define(ACCEPT_TIMEOUT_DEFAULT, 5000).
+-define(ACCEPT_TIMEOUT_DEFAULT, 300000).
 -define(CONNECT_MAX_DEFAULT, 1024000).
 
 -define(TCP_OPTIONS_DEFAULT, [
