@@ -125,7 +125,7 @@ handle_info({'EXIT', Pid, Reason}, #state{name = Name, conn_cur = Conn, tab = Ta
       {noreply, S}
   end;
 handle_info(_Msg, #state{name = Name} = State) ->
-  ?LOG_WARNING("~p unhandled info msg :~p", [Name, _Request]),
+  ?LOG_WARNING("~p unhandled info msg :~p", [Name, _Msg]),
   {noreply, State}.
 
 code_change(_OldVersion, Library, _Extra) ->
