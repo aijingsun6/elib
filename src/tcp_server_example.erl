@@ -10,13 +10,7 @@
 %% API
 
 start_server(Port) ->
-  TcpOpt = [
-    binary,
-    {packet, 2},
-    {backlog, 2048},
-    {reuseaddr, true},
-    {send_timeout, 5000}
-  ],
+  TcpOpt = [binary, {active, false}, {packet, 2}, {backlog, 2048}, {reuseaddr, true}, {send_timeout, 5000}],
   tcp_server:start_link(tcp_server, Port, {?MODULE, loop}, undefined, TcpOpt, #{}).
 
 loop(Parent, Socket) ->
@@ -61,22 +55,21 @@ start_client(Addr, Port) ->
 
 init(Addr, Port) ->
   process_flag(trap_exit, true),
-  TcpOpt = [binary, {packet, 2}, {active, false}, {send_timeout, 5000}],
+  TcpOpt = [binary, {packet, 2}, {active, true}, {send_timeout, 5000}],
   {ok, S} = gen_tcp:connect(Addr, Port, TcpOpt),
   loop_client(S, queue:new()).
 
 loop_client(S, Q) ->
-  inet:setopts(S, [{active, once}]),
   receive
     {tcp, S, Data} ->
       Resp = erlang:binary_to_term(Data),
       {{value, FROM}, Q2} = queue:out(Q),
       FROM ! {self(), Resp},
-      loop(S, Q2);
+      loop_client(S, Q2);
     {From, Req} when is_pid(From) ->
       gen_tcp:send(S, erlang:term_to_binary(Req)),
       Q2 = queue:in(From, Q),
-      loop(S, Q2);
+      loop_client(S, Q2);
     {tcp_closed, S} ->
       io:format("Socket ~w closed [~w]~n", [S, self()]),
       ok
