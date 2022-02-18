@@ -24,6 +24,7 @@
 
 -record(state, {
   name,
+  pid,
   port,
   accept_num,
   accept_timeout,
@@ -31,10 +32,13 @@
   listen_sock,             % listen socket
   conn_cur,                % current connection
   conn_max,                % max connection
-  loop,                    % {M,F}  M:F(Name,Socket)
-  reject,                  % {M,F}  M:F(Name,Socket)
-  ref_tab                  % {Ref, Pid, Socket}
+  loop,                    % {M,F}  M:F(Pid,Socket)
+  reject,                  % {M,F}  M:F(Pid,Socket)
+  tab                  % {Pid, Socket}
 }).
+
+-callback loop(Father :: pid(), S :: inet:socket()) -> any().
+-callback reject(Father :: pid(), S :: inet:socket()) -> any().
 
 -export([
   init/1,
@@ -84,7 +88,7 @@ init(S = #state{name = Name, port = Port, accept_num = AcceptNum, tcp_options = 
       ?LOG_INFO("~p,socket listen success at port ~p", [Name, Port]),
       Tab = tab_name(Name),
       ets:new(Tab, [named_table, set]),
-      S2 = S#state{listen_sock = ListenSock, ref_tab = Tab},
+      S2 = S#state{listen_sock = ListenSock, tab = Tab, pid = self()},
       start_accept(AcceptNum, S2),
       {ok, S2};
     {error, Why} ->
@@ -92,11 +96,11 @@ init(S = #state{name = Name, port = Port, accept_num = AcceptNum, tcp_options = 
       {stop, Why}
   end.
 
-handle_call({check_conn_num, Pid, Socket}, _, #state{conn_cur = Conn, conn_max = MaxConn, ref_tab = Tab} = S) ->
+handle_call({check_conn_num, Pid, Socket}, _, #state{conn_cur = Conn, conn_max = MaxConn, tab = Tab} = S) ->
   case Conn < MaxConn of
     true ->
-      Ref = erlang:monitor(process, Pid),
-      ets:insert(Tab, {Ref, Pid, Socket}),
+      erlang:link(Pid),
+      ets:insert(Tab, {Pid, Socket}),
       {reply, true, S#state{conn_cur = Conn + 1}};
     false ->
       {reply, false, S}
@@ -111,12 +115,11 @@ handle_cast(_Request, #state{name = Name} = State) ->
   ?LOG_WARNING("~p unhandled cast msg :~p", [Name, _Request]),
   {noreply, State}.
 
-handle_info({'DOWN', Ref, _Type, _Object, _Info}, #state{name = Name, conn_cur = Conn, ref_tab = Tab} = S) ->
-  erlang:demonitor(Ref, [flush]),
-  case ets:lookup(Tab, Ref) of
-    [{_, Pid, Socket}] ->
-      ?LOG_INFO("~p, pid ~p, socket ~p disconnect.", [Name, Pid, socket_ip_str(Socket)]),
-      ets:delete(Tab, Ref),
+handle_info({'EXIT', Pid, Reason}, #state{name = Name, conn_cur = Conn, tab = Tab} = S) ->
+  case ets:lookup(Tab, Pid) of
+    [{Pid, Socket}] ->
+      ?LOG_INFO("~p, pid ~p, socket ~p disconnect, reason ~p", [Name, Pid, socket_ip_str(Socket), Reason]),
+      ets:delete(Tab, Pid),
       {noreply, S#state{conn_cur = Conn - 1}};
     [] ->
       {noreply, S}
@@ -128,11 +131,9 @@ handle_info(_Msg, #state{name = Name} = State) ->
 code_change(_OldVersion, Library, _Extra) ->
   {ok, Library}.
 
-terminate(_Reason, #state{name = Name, listen_sock = ListenSock, ref_tab = Tab}) ->
+terminate(_Reason, #state{name = Name, listen_sock = ListenSock}) ->
   ?LOG_INFO("~p stopping with ~p", [Name, _Reason]),
   gen_tcp:close(ListenSock),
-  F = fun({_Ref, Pid, _Sock}, Acc) -> erlang:exit(Pid, _Reason), Acc end,
-  ets:foldl(F, [], Tab),
   ok.
 
 loop_func(Name, Socket, {M, F}) ->
@@ -140,15 +141,13 @@ loop_func(Name, Socket, {M, F}) ->
     M:F(Name, Socket)
   catch
     ?EXCEPTION(Class, Reason, Stacktrace) ->
-      catch gen_tcp:close(Socket),
       ?LOG_ERROR("tcp loop fail, stacktrace: ~p, class: ~p, reason: ~p ~n", [?GET_STACK(Stacktrace), Class, Reason])
   end.
 
 reject_func(Name, Socket, {M, F}) ->
-  M:F(Name, Socket),
-  gen_tcp:close(Socket);
-reject_func(_, Socket, _) ->
-  gen_tcp:close(Socket).
+  M:F(Name, Socket);
+reject_func(_, _, _) ->
+  ok.
 
 start_accept(Num, _State) when Num < 1 ->
   ok;
@@ -156,7 +155,8 @@ start_accept(Num, State) ->
   proc_lib:spawn(fun() -> accept(State) end),
   start_accept(Num - 1, State).
 
-accept(#state{name = Name, listen_sock = ListenSock, loop = Loop, reject = Reject, accept_timeout = Timeout}) ->
+accept(#state{name = Name, pid = PID, listen_sock = ListenSock, loop = Loop, reject = Reject, accept_timeout = Timeout}) ->
+  process_flag(trap_exit, true),
   case gen_tcp:accept(ListenSock, Timeout) of
     {ok, Socket} ->
       Self = self(),
@@ -164,9 +164,9 @@ accept(#state{name = Name, listen_sock = ListenSock, loop = Loop, reject = Rejec
       gen_server:cast(Name, accept_new),
       case gen_server:call(Name, {check_conn_num, Self, Socket}) of
         true ->
-          loop_func(Name, Socket, Loop);
+          loop_func(PID, Socket, Loop);
         false ->
-          reject_func(Name, Socket, Reject)
+          reject_func(PID, Socket, Reject)
       end;
     {error, Reason} ->
       ?LOG_ERROR("~p accept socket fail with ~p", [Name, Reason]),
