@@ -3,7 +3,6 @@
 -behavior(gen_server).
 
 -define(ACCEPT_NUM_DEFAULT, 8).
--define(ACCEPT_TIMEOUT_DEFAULT, 300000).
 -define(CONNECT_MAX_DEFAULT, 1024000).
 
 -define(TCP_OPTIONS_DEFAULT, [
@@ -27,7 +26,6 @@
   pid,
   port,
   accept_num,
-  accept_timeout,
   tcp_options,
   listen_sock,             % listen socket
   conn_cur,                % current connection
@@ -60,17 +58,14 @@ start_link(Name, Port, Loop, Reject) ->
 start_link(Name, Port, Loop, Reject, TcpOption, Prop) ->
   ConnMax = maps:get(conn_max, Prop, ?CONNECT_MAX_DEFAULT),
   AcceptNum = maps:get(accept_num, Prop, ?ACCEPT_NUM_DEFAULT),
-  AcceptTimeout = maps:get(accept_timeout, Prop, ?ACCEPT_TIMEOUT_DEFAULT),
   true = (is_integer(ConnMax) andalso ConnMax > 0),
   true = (is_integer(AcceptNum) andalso AcceptNum > 0),
-  true = (is_integer(AcceptTimeout) andalso AcceptTimeout > 0),
   S = #state{
     name = Name,
     port = Port,
     conn_cur = 0,
     conn_max = ConnMax,
     accept_num = AcceptNum,
-    accept_timeout = AcceptTimeout,
     tcp_options = TcpOption,
     loop = Loop,
     reject = Reject
@@ -157,7 +152,7 @@ start_accept(Num, State) ->
 
 accept(#state{name = Name, pid = PID, listen_sock = ListenSock, loop = Loop, reject = Reject, accept_timeout = Timeout}) ->
   process_flag(trap_exit, true),
-  case gen_tcp:accept(ListenSock, Timeout) of
+  case gen_tcp:accept(ListenSock) of
     {ok, Socket} ->
       Self = self(),
       ?LOG_INFO("~p,pid:~p,accept socket ~ts", [Name, Self, socket_ip_str(Socket)]),

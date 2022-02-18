@@ -13,7 +13,6 @@ start_server(Port) ->
   TcpOpt = [
     binary,
     {packet, 2},
-    {active, once},
     {backlog, 2048},
     {reuseaddr, true},
     {send_timeout, 5000}
@@ -62,7 +61,7 @@ start_client(Addr, Port) ->
 
 init(Addr, Port) ->
   process_flag(trap_exit, true),
-  TcpOpt = [binary, {packet, 2}, {active, once}, {send_timeout, 5000}],
+  TcpOpt = [binary, {packet, 2}, {send_timeout, 5000}],
   {ok, S} = gen_tcp:connect(Addr, Port, TcpOpt),
   loop_client(S, queue:new()).
 
