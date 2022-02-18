@@ -150,7 +150,7 @@ start_accept(Num, State) ->
   proc_lib:spawn(fun() -> accept(State) end),
   start_accept(Num - 1, State).
 
-accept(#state{name = Name, pid = PID, listen_sock = ListenSock, loop = Loop, reject = Reject, accept_timeout = Timeout}) ->
+accept(#state{name = Name, pid = PID, listen_sock = ListenSock, loop = Loop, reject = Reject}) ->
   process_flag(trap_exit, true),
   case gen_tcp:accept(ListenSock) of
     {ok, Socket} ->
